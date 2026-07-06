@@ -203,6 +203,26 @@ impl TlsSettings {
         })
     }
 
+    /// Create [`TlsSettings`] that select the server certificate dynamically
+    /// via a rustls [`ResolvesServerCert`] (for example an ACME cert store),
+    /// instead of loading a static cert/key file. The resolver is consulted on
+    /// every handshake, so a rotated or newly-issued cert is served live
+    /// without rebuilding the listener.
+    pub fn with_cert_resolver(resolver: Arc<dyn ResolvesServerCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_cert_verifier: None,
+            cert_resolver: Some(resolver),
+            callbacks: None,
+            offload_threadpool: None,
+        })
+    }
+
     /// Create a new [`TlsSettings`] with post-handshake callbacks.
     ///
     /// Before calling `build()`, supply either a cert/key pair via
