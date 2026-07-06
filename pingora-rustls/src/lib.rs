@@ -26,7 +26,7 @@ pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-pub use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
+pub use rustls::server::{ClientCertVerifierBuilder, ResolvesServerCert, WebPkiClientVerifier};
 pub use rustls::{
     client::WebPkiServerVerifier, crypto::CryptoProvider, version, CertificateError, ClientConfig,
     DigitallySignedStruct, Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig,
