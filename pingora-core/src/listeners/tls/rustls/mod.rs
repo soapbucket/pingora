@@ -21,6 +21,7 @@ use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
+use pingora_rustls::ResolvesServerCert;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
@@ -32,6 +33,10 @@ pub struct TlsSettings {
     cert_path: String,
     key_path: String,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    // sbproxy fork addition (WOR-1772): when set, the acceptor selects the
+    // server cert dynamically via this rustls resolver instead of loading a
+    // static cert/key file, so an ACME cert store can swap certs live.
+    cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
 }
 
 pub struct Acceptor {
@@ -48,14 +53,6 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
-        };
-
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
         let builder = if let Some(verifier) = self.client_cert_verifier {
@@ -63,12 +60,27 @@ impl TlsSettings {
         } else {
             builder.with_no_client_auth()
         };
-        let mut config = builder
-            .with_single_cert(certs, key)
-            .explain_err(InternalError, |e| {
-                format!("Failed to create server listener config: {e}")
-            })
-            .unwrap();
+
+        // sbproxy fork (WOR-1772): a dynamic resolver takes precedence over a
+        // static cert file, so the acceptor picks the cert per handshake (SNI)
+        // and an ACME renewal is served live without rebuilding the listener.
+        let mut config = if let Some(resolver) = self.cert_resolver {
+            builder.with_cert_resolver(resolver)
+        } else {
+            let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
+            else {
+                panic!(
+                    "Failed to load provided certificates \"{}\" or key \"{}\".",
+                    self.cert_path, self.key_path
+                )
+            };
+            builder
+                .with_single_cert(certs, key)
+                .explain_err(InternalError, |e| {
+                    format!("Failed to create server listener config: {e}")
+                })
+                .unwrap()
+        };
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -104,6 +116,25 @@ impl TlsSettings {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
             client_cert_verifier: None,
+            cert_resolver: None,
+        })
+    }
+
+    /// Create [`TlsSettings`] that select the server certificate dynamically
+    /// via a rustls [`ResolvesServerCert`] (for example an ACME cert store),
+    /// instead of loading a static cert/key file. The resolver is consulted on
+    /// every handshake, so a rotated or newly-issued cert is served live
+    /// without rebuilding the listener. sbproxy fork addition (WOR-1772).
+    pub fn with_cert_resolver(resolver: Arc<dyn ResolvesServerCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_cert_verifier: None,
+            cert_resolver: Some(resolver),
         })
     }
 
