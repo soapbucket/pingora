@@ -478,6 +478,12 @@ pub trait ProxyHttp {
 
     /// This filter is called when there is an error **after** a connection is established (or reused)
     /// to the upstream.
+    ///
+    /// Returning an error with `retry()` set causes the request to be retried
+    /// against a fresh upstream, subject to two safety gates enforced by the
+    /// proxy loop and the retry buffer: a retry is refused once any response
+    /// bytes have been sent downstream, and a request body can only be
+    /// replayed while it is fully held in the retry buffer.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,

@@ -890,7 +890,21 @@ where
 
             match e {
                 Some(error) => {
-                    let retry = error.retry();
+                    let mut retry = error.retry();
+                    // A retry replays the request against a fresh upstream and
+                    // produces a brand new response. Once any part of the old
+                    // response has already reached the client, that replay
+                    // would interleave two responses on one downstream stream,
+                    // so the retry flag is refused regardless of who set it.
+                    // Errors from before the response phase are unaffected.
+                    if retry && session.as_ref().response_written().is_some() {
+                        warn!(
+                            "Retry requested after response bytes were sent downstream, refusing: {}, {}",
+                            error,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                        retry = false;
+                    }
                     proxy_error = Some(error);
                     if !retry {
                         break;
