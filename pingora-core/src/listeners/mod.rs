@@ -175,6 +175,31 @@ impl TransportStackBuilder {
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
     ) -> Result<TransportStack> {
+        self.build_with_retry(
+            #[cfg(unix)]
+            upgrade_listeners,
+            true,
+        )
+        .await
+    }
+
+    async fn build_once(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+    ) -> Result<TransportStack> {
+        self.build_with_retry(
+            #[cfg(unix)]
+            upgrade_listeners,
+            false,
+        )
+        .await
+    }
+
+    async fn build_with_retry(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+        retry_address_in_use: bool,
+    ) -> Result<TransportStack> {
         let mut builder = ListenerEndpoint::builder();
 
         builder.listen_addr(self.l4.clone());
@@ -185,10 +210,18 @@ impl TransportStackBuilder {
         }
 
         #[cfg(unix)]
-        let l4 = builder.listen(upgrade_listeners).await?;
+        let l4 = if retry_address_in_use {
+            builder.listen(upgrade_listeners).await?
+        } else {
+            builder.listen_once(upgrade_listeners).await?
+        };
 
         #[cfg(windows)]
-        let l4 = builder.listen().await?;
+        let l4 = if retry_address_in_use {
+            builder.listen().await?
+        } else {
+            builder.listen_once().await?
+        };
 
         Ok(TransportStack {
             l4,
@@ -506,15 +539,47 @@ impl Listeners {
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
     ) -> Result<Vec<TransportStack>> {
+        self.build_with_retry(
+            #[cfg(unix)]
+            upgrade_listeners,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn build_once(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+    ) -> Result<Vec<TransportStack>> {
+        self.build_with_retry(
+            #[cfg(unix)]
+            upgrade_listeners,
+            false,
+        )
+        .await
+    }
+
+    async fn build_with_retry(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+        retry_address_in_use: bool,
+    ) -> Result<Vec<TransportStack>> {
         let mut stacks = Vec::with_capacity(self.stacks.len());
 
         for b in self.stacks.iter_mut() {
-            let new_stack = b
-                .build(
+            let new_stack = if retry_address_in_use {
+                b.build(
                     #[cfg(unix)]
                     upgrade_listeners.clone(),
                 )
-                .await?;
+                .await?
+            } else {
+                b.build_once(
+                    #[cfg(unix)]
+                    upgrade_listeners.clone(),
+                )
+                .await?
+            };
 
             stacks.push(new_stack);
         }
