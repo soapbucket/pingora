@@ -220,7 +220,11 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
     }
 }
 
-async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener> {
+async fn bind_tcp(
+    addr: &str,
+    opt: Option<TcpSocketOptions>,
+    retry_address_in_use: bool,
+) -> Result<Listener> {
     let mut try_count = 0;
     loop {
         let sock_addr = addr
@@ -255,6 +259,9 @@ async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener>
                 if e.kind() != ErrorKind::AddrInUse {
                     break Err(e).or_err_with(BindError, || format!("bind() failed on {addr}"));
                 }
+                if !retry_address_in_use {
+                    break Err(e).or_err_with(BindError, || format!("bind() failed on {addr}"));
+                }
                 try_count += 1;
                 if try_count >= TCP_LISTENER_MAX_TRY {
                     break Err(e).or_err_with(BindError, || {
@@ -268,11 +275,11 @@ async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener>
     }
 }
 
-async fn bind(addr: &ServerAddress) -> Result<Listener> {
+async fn bind(addr: &ServerAddress, retry_address_in_use: bool) -> Result<Listener> {
     match addr {
         #[cfg(unix)]
         ServerAddress::Uds(l, perm) => uds::bind(l, perm.clone()),
-        ServerAddress::Tcp(l, opt) => bind_tcp(l, opt.clone()).await,
+        ServerAddress::Tcp(l, opt) => bind_tcp(l, opt.clone(), retry_address_in_use).await,
     }
 }
 
@@ -313,6 +320,20 @@ impl ListenerEndpointBuilder {
 
     #[cfg(unix)]
     pub async fn listen(self, fds: Option<ListenFds>) -> Result<ListenerEndpoint> {
+        self.listen_with_retry(fds, true).await
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn listen_once(self, fds: Option<ListenFds>) -> Result<ListenerEndpoint> {
+        self.listen_with_retry(fds, false).await
+    }
+
+    #[cfg(unix)]
+    async fn listen_with_retry(
+        self,
+        fds: Option<ListenFds>,
+        retry_address_in_use: bool,
+    ) -> Result<ListenerEndpoint> {
         let listen_addr = self
             .listen_addr
             .expect("Tried to listen with no addr specified");
@@ -327,13 +348,13 @@ impl ListenerEndpointBuilder {
                 from_raw_fd(&listen_addr, *fd)?
             } else {
                 // not found
-                let listener = bind(&listen_addr).await?;
+                let listener = bind(&listen_addr, retry_address_in_use).await?;
                 table.add(addr_str.to_string(), listener.as_raw_fd());
                 listener
             }
         } else {
             // not found, no fd table
-            bind(&listen_addr).await?
+            bind(&listen_addr, retry_address_in_use).await?
         };
 
         #[cfg(feature = "connection_filter")]
@@ -351,11 +372,21 @@ impl ListenerEndpointBuilder {
 
     #[cfg(windows)]
     pub async fn listen(self) -> Result<ListenerEndpoint> {
+        self.listen_with_retry(true).await
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn listen_once(self) -> Result<ListenerEndpoint> {
+        self.listen_with_retry(false).await
+    }
+
+    #[cfg(windows)]
+    async fn listen_with_retry(self, retry_address_in_use: bool) -> Result<ListenerEndpoint> {
         let listen_addr = self
             .listen_addr
             .expect("Tried to listen with no addr specified");
 
-        let listener = bind(&listen_addr).await?;
+        let listener = bind(&listen_addr, retry_address_in_use).await?;
 
         #[cfg(feature = "connection_filter")]
         let connection_filter = self
@@ -568,7 +599,7 @@ mod test {
         // This should fail with "address already in use"
         let mut builder2 = ListenerEndpoint::builder();
         builder2.listen_addr(ServerAddress::Tcp(addr.into(), Some(sock_opt_no_reuseport)));
-        let result = builder2.listen(None).await;
+        let result = builder2.listen_once(None).await;
 
         // The second bind should fail
         assert!(result.is_err());
