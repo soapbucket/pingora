@@ -47,6 +47,7 @@ pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> +
 pub struct Service<A> {
     name: String,
     listeners: Listeners,
+    prepared_endpoints: Option<Vec<TransportStack>>,
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
@@ -61,6 +62,7 @@ impl<A> Service<A> {
         Service {
             name,
             listeners: Listeners::new(),
+            prepared_endpoints: None,
             app_logic: Some(app_logic),
             threads: None,
             runtime_opts_override: None,
@@ -75,6 +77,7 @@ impl<A> Service<A> {
         Service {
             name,
             listeners,
+            prepared_endpoints: None,
             app_logic: Some(app_logic),
             threads: None,
             runtime_opts_override: None,
@@ -117,6 +120,7 @@ impl<A> Service<A> {
     /// ```
     #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        self.prepared_endpoints = None;
         self.connection_filter = filter.clone();
         self.listeners.set_connection_filter(filter);
     }
@@ -126,6 +130,7 @@ impl<A> Service<A> {
 
     /// Get the [`Listeners`], mostly to add more endpoints.
     pub fn endpoints(&mut self) -> &mut Listeners {
+        self.prepared_endpoints = None;
         &mut self.listeners
     }
 
@@ -133,6 +138,7 @@ impl<A> Service<A> {
 
     /// Add a TCP listening endpoint with the given address (e.g., `127.0.0.1:8000`).
     pub fn add_tcp(&mut self, addr: &str) {
+        self.prepared_endpoints = None;
         self.listeners.add_tcp(addr);
     }
 
@@ -143,6 +149,7 @@ impl<A> Service<A> {
 
     /// Add a TCP listening endpoint with the given [`TcpSocketOptions`].
     pub fn add_tcp_with_settings(&mut self, addr: &str, sock_opt: TcpSocketOptions) {
+        self.prepared_endpoints = None;
         self.listeners.add_tcp_with_settings(addr, sock_opt);
     }
 
@@ -152,11 +159,13 @@ impl<A> Service<A> {
     /// everyone (0o666).
     #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
+        self.prepared_endpoints = None;
         self.listeners.add_uds(addr, perm);
     }
 
     /// Add a TLS listening endpoint with the given certificate and key paths.
     pub fn add_tls(&mut self, addr: &str, cert_path: &str, key_path: &str) -> Result<()> {
+        self.prepared_endpoints = None;
         self.listeners.add_tls(addr, cert_path, key_path)
     }
 
@@ -167,13 +176,40 @@ impl<A> Service<A> {
         sock_opt: Option<TcpSocketOptions>,
         settings: TlsSettings,
     ) {
+        self.prepared_endpoints = None;
         self.listeners
             .add_tls_with_settings(addr, sock_opt, settings)
     }
 
     /// Add an endpoint according to the given [`ServerAddress`]
     pub fn add_address(&mut self, addr: ServerAddress) {
+        self.prepared_endpoints = None;
         self.listeners.add_address(addr);
+    }
+
+    /// Bind and retain every configured listening endpoint before the service starts.
+    ///
+    /// This lets callers surface address and permission failures synchronously instead
+    /// of discovering them in a service task after [`crate::server::Server::run`] has
+    /// started. The successfully bound sockets are retained and later consumed by the
+    /// service; this method does not probe, drop, and rebind them.
+    ///
+    /// Address-in-use errors are returned immediately rather than using the listener
+    /// task's compatibility retry loop. Configure all endpoints before calling this
+    /// method. Any later endpoint mutation drops the prepared sockets and requires
+    /// preparation again.
+    pub async fn prepare_listeners(&mut self) -> Result<()> {
+        if self.prepared_endpoints.is_none() {
+            self.prepared_endpoints = Some(
+                self.listeners
+                    .build_once(
+                        #[cfg(unix)]
+                        None,
+                    )
+                    .await?,
+            );
+        }
+        Ok(())
     }
 
     /// Get a reference to the application inside this service
@@ -283,14 +319,17 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         listeners_per_fd: usize,
     ) {
         let runtime = current_handle();
-        let endpoints = self
-            .listeners
-            .build(
-                #[cfg(unix)]
-                fds,
-            )
-            .await
-            .expect("Failed to build listeners");
+        let endpoints = match self.prepared_endpoints.take() {
+            Some(endpoints) => endpoints,
+            None => self
+                .listeners
+                .build(
+                    #[cfg(unix)]
+                    fds,
+                )
+                .await
+                .expect("Failed to build listeners"),
+        };
 
         let app_logic = self
             .app_logic
@@ -335,5 +374,59 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
     fn listen_addresses(&self) -> Option<Vec<String>> {
         Some(self.listeners.addresses())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Service;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn unused_loopback_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral fixture listener");
+        let address = listener
+            .local_addr()
+            .expect("read fixture listener address");
+        drop(listener);
+        address.to_string()
+    }
+
+    #[tokio::test]
+    async fn prepare_listeners_returns_a_real_port_collision_promptly() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy ephemeral port");
+        let address = occupied.local_addr().expect("read occupied address");
+        let mut service = Service::new("collision fixture".to_string(), ());
+        service.add_tcp(&address.to_string());
+
+        let error = tokio::time::timeout(Duration::from_millis(500), service.prepare_listeners())
+            .await
+            .expect("explicit listener preparation must not retry an occupied port")
+            .expect_err("occupied listener must fail preparation");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains(&address.to_string()), "{rendered}");
+        assert!(
+            rendered.to_ascii_lowercase().contains("in use"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_listeners_retains_the_bound_socket_until_service_drop() {
+        let address = unused_loopback_address();
+        let mut service = Service::new("retained listener fixture".to_string(), ());
+        service.add_tcp(&address);
+
+        service
+            .prepare_listeners()
+            .await
+            .expect("prepare available listener");
+        let collision = TcpListener::bind(&address)
+            .expect_err("prepared service must retain its actual bound socket");
+        assert_eq!(collision.kind(), std::io::ErrorKind::AddrInUse);
+
+        drop(service);
+        TcpListener::bind(&address).expect("dropping service must release prepared listener");
     }
 }
