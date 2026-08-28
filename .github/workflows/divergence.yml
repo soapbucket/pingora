@@ -1,0 +1,52 @@
+# Print how far this fork has drifted from Cloudflare's pingora.
+#
+# Informational, never blocking. The point is that the number is in front of
+# whoever opens a PR here, rather than discovered at rebase time. It sits in
+# its own file so a rebase onto a new upstream commit cannot conflict on it.
+name: divergence
+
+on:
+  pull_request:
+    branches: [sbproxy-0.8.0]
+  push:
+    branches: [sbproxy-0.8.0]
+  workflow_dispatch:
+
+jobs:
+  report:
+    name: divergence from upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history, because the report is a merge base and two
+          # commit counts against it.
+          fetch-depth: 0
+
+      - name: Report
+        run: |
+          git remote add upstream https://github.com/cloudflare/pingora.git
+          git fetch --quiet upstream main
+          git fetch --quiet origin sbproxy-0.8.0
+
+          upstream=upstream/main
+          fork=origin/sbproxy-0.8.0
+          base=$(git merge-base "$upstream" "$fork")
+          read -r behind ahead <<<"$(git rev-list --left-right --count "$upstream...$fork")"
+          src=$(git diff --name-only "$upstream...$fork" | grep -cv '^\.github/' || true)
+
+          {
+            echo "### Divergence from \`cloudflare/pingora\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream \`main\` | \`$(git rev-parse --short "$upstream")\` |"
+            echo "| merge base | \`$(git rev-parse --short "$base")\` ($(git log -1 --format=%ad --date=short "$base")) |"
+            echo "| behind | $behind upstream commits |"
+            echo "| ahead | $ahead of ours |"
+            echo "| files | $src outside \`.github/\` |"
+            echo
+            echo "Ours:"
+            echo
+            git log --format='- \`%h\` %s' "$upstream..$fork"
+          } >> "$GITHUB_STEP_SUMMARY"
