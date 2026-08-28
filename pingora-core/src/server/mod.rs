@@ -662,6 +662,14 @@ impl Server {
             panic!("Daemonizing under windows is not supported");
         }
 
+        // Before anything spawns. Service runtimes read the size out of
+        // their own `RuntimeOpts`, but the offload pools are built
+        // lazily from four call sites that carry no options, so this is
+        // how `runtime_thread_stack_size` reaches them.
+        pingora_runtime::worker_stack::set_process_default_stack_size(
+            conf.runtime_thread_stack_size.unwrap_or(0),
+        );
+
         let blocking_opts = BlockingPoolOpts {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),

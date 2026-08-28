@@ -35,6 +35,19 @@ use std::time::Duration;
 const DEFAULT_MAX_RETRIES: usize = 16;
 const MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS: usize = 1024;
 
+/// Smallest stack a service runtime thread may be configured with.
+///
+/// This rules out one thing only: a typo like `runtime_thread_stack_size:
+/// 8` that reads as bytes and means megabytes. It is not a safe lower
+/// bound. `std::thread::Builder::stack_size` clamps up to a platform
+/// minimum and the platform's minimum is far below what a proxy request
+/// path needs, so any value in the low kilobytes still produces a
+/// runtime that starts and then aborts on its first request. There is no
+/// value this check could use that would be a real floor, because the
+/// real floor is whatever the application's deepest call chain needs,
+/// which is what the measurement in `worker_stack` exists to report.
+const MIN_RUNTIME_THREAD_STACK_SIZE: usize = 4 * 1024;
+
 /// The configuration file
 ///
 /// Pingora configuration files are by default YAML files, but any key value format can potentially
@@ -149,6 +162,14 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// Stack size, in bytes, for every thread a service runtime spawns.
+    ///
+    /// A worker polls the whole application future chain on this stack.
+    /// When not set, [`pingora_runtime::DEFAULT_THREAD_STACK_SIZE`] is
+    /// used. On a 64-bit target the cost of raising it is address space
+    /// rather than memory: a thread stack is committed page by page as
+    /// it is touched.
+    pub runtime_thread_stack_size: Option<usize>,
     /// Timeout durations greater than this threshold use Tokio's native timeout instead of
     /// Pingora's fast timeout.
     ///
@@ -248,6 +269,7 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            runtime_thread_stack_size: None,
             fast_timeout_to_tokio_threshold_seconds: Some(
                 pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
             ),
@@ -365,6 +387,21 @@ impl ServerConf {
         if self.max_blocking_threads == Some(0) {
             return Error::e_explain(ReadError, "max_blocking_threads must be greater than zero");
         }
+        // A page is the smallest mapping the kernel can hand out and a
+        // thread that gets one cannot run a single call. Refusing here
+        // is better than a runtime that starts and then aborts on its
+        // first request.
+        if self
+            .runtime_thread_stack_size
+            .is_some_and(|size| size < MIN_RUNTIME_THREAD_STACK_SIZE)
+        {
+            return Error::e_explain(
+                ReadError,
+                format!(
+                    "runtime_thread_stack_size must be at least {MIN_RUNTIME_THREAD_STACK_SIZE} bytes"
+                ),
+            );
+        }
         if self.runtime_metrics_poll_time_histogram_resolution_micros == Some(0) {
             return Error::e_explain(
                 ReadError,
@@ -425,6 +462,7 @@ impl ServerConf {
                 poll_time_histogram_buckets: self.runtime_metrics_poll_time_histogram_buckets,
             },
             enable_alt_timer: self.runtime_enable_alt_timer,
+            thread_stack_size: self.runtime_thread_stack_size,
             #[cfg(feature = "dial9")]
             dial9: None,
         }
@@ -495,6 +533,7 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            runtime_thread_stack_size: None,
             fast_timeout_to_tokio_threshold_seconds: Some(
                 pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
             ),
@@ -645,6 +684,53 @@ working_directory: /var/lib/pingora
         assert_eq!(
             yaml.get("working_directory"),
             Some(&serde_yaml::Value::String("/var/lib/pingora".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_runtime_thread_stack_size_reaches_the_runtime_opts() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_thread_stack_size: 16777216
+        "#;
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(conf.runtime_thread_stack_size, Some(16 * 1024 * 1024));
+        assert_eq!(
+            conf.runtime_opts().resolved_thread_stack_size(),
+            16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_unset_runtime_thread_stack_size_uses_the_pingora_default() {
+        init_log();
+        let conf = ServerConf::from_yaml("---\nversion: 1\n").unwrap();
+        assert_eq!(conf.runtime_thread_stack_size, None);
+        // Against the process default rather than the crate constant.
+        // "Unset means the process default" is the actual contract, and
+        // asserting the constant would make this test depend on no other
+        // test in the binary having set the global, which is not a
+        // property a unit test should be asserting by accident.
+        assert_eq!(
+            conf.runtime_opts().resolved_thread_stack_size(),
+            pingora_runtime::worker_stack::process_default_stack_size(),
+            "a server that says nothing gets the process default stack"
+        );
+    }
+
+    #[test]
+    fn test_a_runtime_thread_stack_size_below_a_page_is_rejected() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_thread_stack_size: 512
+        "#;
+        assert!(
+            ServerConf::from_yaml(conf_str).is_err(),
+            "a stack no thread can make a call on has to fail at startup, not at the first request"
         );
     }
 
