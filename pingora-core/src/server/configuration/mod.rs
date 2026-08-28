@@ -37,9 +37,15 @@ const MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS: usize = 1024;
 
 /// Smallest stack a service runtime thread may be configured with.
 ///
-/// One 4 KiB page: below that the thread cannot make a call at all, and
-/// the failure would land as an abort on the first request rather than
-/// as a config error at startup.
+/// This rules out one thing only: a typo like `runtime_thread_stack_size:
+/// 8` that reads as bytes and means megabytes. It is not a safe lower
+/// bound. `std::thread::Builder::stack_size` clamps up to a platform
+/// minimum and the platform's minimum is far below what a proxy request
+/// path needs, so any value in the low kilobytes still produces a
+/// runtime that starts and then aborts on its first request. There is no
+/// value this check could use that would be a real floor, because the
+/// real floor is whatever the application's deepest call chain needs,
+/// which is what the measurement in `worker_stack` exists to report.
 const MIN_RUNTIME_THREAD_STACK_SIZE: usize = 4 * 1024;
 
 /// The configuration file
@@ -702,10 +708,15 @@ runtime_thread_stack_size: 16777216
         init_log();
         let conf = ServerConf::from_yaml("---\nversion: 1\n").unwrap();
         assert_eq!(conf.runtime_thread_stack_size, None);
+        // Against the process default rather than the crate constant.
+        // "Unset means the process default" is the actual contract, and
+        // asserting the constant would make this test depend on no other
+        // test in the binary having set the global, which is not a
+        // property a unit test should be asserting by accident.
         assert_eq!(
             conf.runtime_opts().resolved_thread_stack_size(),
-            pingora_runtime::DEFAULT_THREAD_STACK_SIZE,
-            "a server that says nothing gets the runtime's default stack"
+            pingora_runtime::worker_stack::process_default_stack_size(),
+            "a server that says nothing gets the process default stack"
         );
     }
 
