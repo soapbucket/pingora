@@ -59,8 +59,22 @@ impl OffloadRuntime {
     }
 
     /// Build every runtime thread in this pool.
+    ///
+    /// These threads get the same stack as the service runtimes, and
+    /// record their stack base the same way. They are not spawned by
+    /// `pingora-runtime`, so nothing in `RuntimeOpts` reaches them; the
+    /// size comes from the process-wide default that `ServerConf` sets
+    /// from `runtime_thread_stack_size`.
+    ///
+    /// It matters because of what runs here. Upstream DNS and `connect`
+    /// are offloaded onto one of these pools, and the downstream TLS
+    /// handshake onto another, and both are real call chains on a real
+    /// stack. Leaving them at the platform default while the workers got
+    /// four times as much would have left two sets of threads that could
+    /// still overflow and that no measurement could see.
     fn init_pools(&self) -> Box<[(Handle, Sender<()>)]> {
         let threads = self.shards * self.thread_per_shard;
+        let stack_size = pingora_runtime::worker_stack::process_default_stack_size();
         let mut pools = Vec::with_capacity(threads);
         for shard in 0..self.shards {
             for thread in 0..self.thread_per_shard {
@@ -68,6 +82,10 @@ impl OffloadRuntime {
                 // tokio runtime, which can be 50% of the on CPU time of the runtimes
                 let rt = Builder::new_current_thread()
                     .enable_all()
+                    .thread_stack_size(stack_size)
+                    .on_thread_start(move || {
+                        pingora_runtime::worker_stack::mark_thread_start(stack_size)
+                    })
                     .build()
                     .expect("failed to build offload runtime");
                 let handler = rt.handle().clone();
@@ -75,13 +93,25 @@ impl OffloadRuntime {
                 let thread_name = format!("{} {shard}.{thread}", self.thread_name);
                 std::thread::Builder::new()
                     .name(thread_name.clone())
+                    // The thread that drives the current-thread runtime
+                    // is this std thread, so the tokio builder above
+                    // cannot size it: this is the one that matters.
+                    .stack_size(stack_size)
                     .spawn(move || {
+                        pingora_runtime::worker_stack::mark_thread_start(stack_size);
                         debug!("{thread_name} started");
                         // the thread that calls block_on() will drive the runtime
                         // rx will return when tx is dropped so this runtime and thread will exit
                         rt.block_on(rx)
                     })
-                    .expect("failed to spawn offload runtime thread");
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to spawn an offload runtime thread with a \
+                             {stack_size}-byte stack: {e}. Lower \
+                             runtime_thread_stack_size, or raise the address space \
+                             this process is allowed."
+                        )
+                    });
                 pools.push((handler, tx));
             }
         }
@@ -103,5 +133,44 @@ impl OffloadRuntime {
         let thread_in_shard = rng.gen_range(0..self.thread_per_shard);
         let pools = self.pools.get_or_init(|| self.init_pools());
         &pools[shard * self.thread_per_shard + thread_in_shard].0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_runtime::worker_stack;
+
+    /// Offload threads get the configured stack and record a base.
+    ///
+    /// Before this, they were plain `std::thread::Builder::new()` with
+    /// neither, so upstream `connect` and the downstream TLS handshake
+    /// ran on the platform default while the service runtimes had been
+    /// given four times as much, and no measurement could see either of
+    /// them. Both are real call chains on a real stack.
+    #[test]
+    fn an_offload_thread_gets_the_process_stack_and_records_its_base() {
+        let size = 5 * 1024 * 1024;
+        worker_stack::set_process_default_stack_size(size);
+
+        let pool = OffloadRuntime::new("offload stack probe", 1, 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        pool.get_runtime(0).spawn(async move {
+            tx.send((worker_stack::base().is_some(), worker_stack::size()))
+                .ok();
+        });
+        let (marked, reported) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the offload thread runs the probe");
+
+        // Restore before asserting, so a failure does not leak the
+        // override into whatever test runs next in this process.
+        worker_stack::set_process_default_stack_size(0);
+
+        assert!(marked, "an offload thread has to record its stack base");
+        assert_eq!(
+            reported, size,
+            "an offload thread gets the process-wide stack size"
+        );
     }
 }
