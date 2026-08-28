@@ -26,10 +26,11 @@
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 #[cfg(feature = "dial9")]
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 use thread_local::ThreadLocal;
 use tokio::runtime::{Builder, Handle};
@@ -41,6 +42,40 @@ pub const DEFAULT_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 /// Default maximum bytes retained locally by dial9.
 #[cfg(feature = "dial9")]
 pub const DEFAULT_DIAL9_MAX_TOTAL_SIZE: u64 = 512 * 1024 * 1024;
+
+pub mod worker_stack;
+
+/// Default stack size, in bytes, for threads this crate's runtimes spawn.
+///
+/// Tokio's own default is 2 MiB, and that is not enough. A Pingora
+/// worker polls the whole application future chain on this stack, and a
+/// debug build gives every async state machine far larger frames than a
+/// release build does, so an application that fits comfortably in
+/// production can abort in CI. The application this fork serves
+/// measured its request path at just over 1 MiB of the 2 MiB default on
+/// a macOS debug build with none of its optional filters wired, and
+/// overflowed the same 2 MiB outright on a Linux debug build with them
+/// wired. Half the budget was already spent before anyone looked.
+///
+/// 8 MiB is the `RLIMIT_STACK` default Linux gives a process's main
+/// thread, which is the size the platform already considers normal for
+/// a thread running arbitrary code. It is four times tokio's default,
+/// which leaves room for years of ordinary growth rather than one more
+/// release: a stack overflow cannot be refactored away in small steps,
+/// because the frames belong to the whole call chain and not to any one
+/// function in it.
+///
+/// The cost of raising it on a 64-bit target is address space, not
+/// memory. A thread stack is an anonymous mapping committed page by page
+/// as it is touched, so resident memory tracks the depth actually
+/// reached and not the size reserved. Sixteen workers plus a server
+/// thread reserve 136 MiB of a 128 TiB address space at this size and
+/// resident nothing extra.
+///
+/// Override per runtime with the `thread_stack_size` field of
+/// [`RuntimeOpts`], or per server with the `runtime_thread_stack_size`
+/// configuration key.
+pub const DEFAULT_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Configuration options for the blocking thread pool used by the runtime.
 ///
@@ -84,9 +119,30 @@ pub struct RuntimeOpts {
     /// This requires building with `--cfg tokio_unstable` and only applies to
     /// Tokio's multi-threaded runtime.
     pub enable_alt_timer: bool,
+    /// Stack size, in bytes, for every thread this runtime spawns.
+    ///
+    /// When not set, [`DEFAULT_THREAD_STACK_SIZE`] is used. It applies to
+    /// work-stealing worker threads, to the per-core threads of a
+    /// no-steal runtime, and to the blocking pool.
+    pub thread_stack_size: Option<usize>,
     /// Options for dial9 Tokio telemetry.
     #[cfg(feature = "dial9")]
     pub dial9: Option<Dial9RuntimeOpts>,
+}
+
+impl RuntimeOpts {
+    /// The stack size these options ask for, in bytes.
+    ///
+    /// The `thread_stack_size` field when set, otherwise
+    /// [`DEFAULT_THREAD_STACK_SIZE`]. A zero is treated as unset rather
+    /// than passed on: tokio panics on a zero stack size, and a runtime
+    /// that refuses to start is a worse answer to a bad config value
+    /// than the default is.
+    pub fn resolved_thread_stack_size(&self) -> usize {
+        self.thread_stack_size
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_THREAD_STACK_SIZE)
+    }
 }
 
 /// Configuration options for dial9 Tokio telemetry.
@@ -455,6 +511,14 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the stack size, in bytes, for every thread this runtime spawns.
+    ///
+    /// Defaults to [`DEFAULT_THREAD_STACK_SIZE`].
+    pub fn thread_stack_size(mut self, bytes: usize) -> Self {
+        self.runtime_opts.thread_stack_size = Some(bytes);
+        self
+    }
+
     /// Set whether Tokio's experimental alternative timer is enabled.
     ///
     /// This requires building with `--cfg tokio_unstable` and only applies to
@@ -465,11 +529,17 @@ impl RuntimeBuilder {
     }
 
     fn build_work_stealing_tokio_builder(&self) -> Builder {
+        let stack_size = self.runtime_opts.resolved_thread_stack_size();
         let mut builder = Builder::new_multi_thread();
         builder
             .enable_all()
             .worker_threads(self.threads)
-            .thread_name(&self.name);
+            .thread_name(&self.name)
+            .thread_stack_size(stack_size)
+            // Records where this thread's stack starts, so the
+            // application can measure how much of it a request actually
+            // uses. One thread-local store per thread, once.
+            .on_thread_start(move || worker_stack::mark_base(stack_size));
         apply_blocking_opts(&mut builder, &self.blocking_pool_opts);
         apply_metrics_opts(&mut builder, &self.runtime_opts.metrics);
         apply_timer_opts(&mut builder, &self.runtime_opts);
@@ -566,24 +636,43 @@ impl Runtime {
 }
 
 // only NoStealRuntime set the pools in thread threads
-static CURRENT_HANDLE: Lazy<ThreadLocal<Pools>> = Lazy::new(ThreadLocal::new);
+/// The no-steal pool a thread should spawn onto, per thread.
+///
+/// Keyed by a thread id the `thread_local` crate hands out and recycles
+/// when a thread exits, so a slot can outlive the thread that filled it
+/// and reappear under an unrelated one. The owning [`ThreadId`] is
+/// stored with the pools and checked on read for exactly that reason:
+/// without it, a thread that never joined a no-steal runtime can be
+/// handed a handle to one that has already shut down, and every task it
+/// spawns is cancelled the moment it is spawned. The slot is a
+/// `RefCell` so a thread that inherits a recycled one can claim it.
+static CURRENT_HANDLE: Lazy<ThreadLocal<Registration>> = Lazy::new(ThreadLocal::new);
 
 /// Return the [Handle] of current runtime.
 /// If the current thread is under a `Steal` runtime, the current [Handle] is returned.
 /// If the current thread is under a `NoSteal` runtime, the [Handle] of a random thread
 /// under this runtime is returned. This function will panic if called outside any runtime.
 pub fn current_handle() -> Handle {
-    if let Some(pools) = CURRENT_HANDLE.get() {
-        // safety: the CURRENT_HANDLE is set when the pool is being initialized in init_pools()
-        let pools = pools.get().unwrap();
-        let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0..pools.len());
-        pools[index].clone()
-    } else {
-        // not NoStealRuntime, just check the current tokio runtime
-        Handle::current()
+    if let Some(slot) = CURRENT_HANDLE.get() {
+        let registered = slot.borrow();
+        if let Some((owner, pools)) = registered.as_ref() {
+            if *owner == thread::current().id() {
+                // The pools are set in init_pools() before the thread
+                // that registers them runs anything else.
+                let pools = pools.get().unwrap();
+                let mut rng = rand::thread_rng();
+                let index = rng.gen_range(0..pools.len());
+                return pools[index].clone();
+            }
+        }
     }
+    // Not a NoStealRuntime thread, or a slot left behind by one that has
+    // exited. Either way the current tokio runtime is the answer.
+    Handle::current()
 }
+
+/// A thread's no-steal pool registration, with the thread that made it.
+type Registration = RefCell<Option<(ThreadId, Pools)>>;
 
 type Control = (Sender<Duration>, JoinHandle<()>);
 type Pools = Arc<OnceCell<Box<[Handle]>>>;
@@ -622,9 +711,13 @@ impl NoStealRuntime {
     fn init_pools(&self) -> (Box<[Handle]>, Vec<Control>) {
         let mut pools = Vec::with_capacity(self.threads);
         let mut controls = Vec::with_capacity(self.threads);
+        let stack_size = self.runtime_opts.resolved_thread_stack_size();
         for _ in 0..self.threads {
             let mut builder = Builder::new_current_thread();
             builder.enable_all();
+            // The blocking pool this runtime spawns gets the same stack
+            // as the thread below drives the runtime on.
+            builder.thread_stack_size(stack_size);
             apply_blocking_opts(&mut builder, &self.blocking_opts);
             apply_metrics_opts(&mut builder, &self.runtime_opts.metrics);
             let rt = builder
@@ -635,8 +728,17 @@ impl NoStealRuntime {
             let pools_ref = self.pools.clone();
             let join = std::thread::Builder::new()
                 .name(self.name.clone())
+                // A no-steal worker is a plain std thread that blocks on
+                // its own current-thread runtime, so the tokio builder
+                // above cannot size it: this is the one that matters.
+                .stack_size(stack_size)
                 .spawn(move || {
-                    CURRENT_HANDLE.get_or(|| pools_ref);
+                    worker_stack::mark_base(stack_size);
+                    // Claim the slot rather than `get_or`, which would
+                    // leave a recycled one holding a dead runtime's
+                    // pools and hand them to this thread.
+                    *CURRENT_HANDLE.get_or_default().borrow_mut() =
+                        Some((thread::current().id(), pools_ref));
                     if let Ok(timeout) = rt.block_on(rx) {
                         rt.shutdown_timeout(timeout);
                     } // else Err(_): tx is dropped, just exit
@@ -779,4 +881,155 @@ fn test_dial9_zero_worker_poll_interval_is_rejected() {
         err.to_string(),
         "dial9 worker_poll_interval must be greater than zero"
     );
+}
+
+/// How much stack the caller has left to prove it can reach.
+///
+/// Recurses with a frame large enough to consume `target` bytes quickly,
+/// touching every frame it makes, and returns the deepest measurement
+/// [`worker_stack::used_here`] reported. A runtime whose threads did not
+/// get the configured stack overflows here instead of returning, which
+/// is a process abort and the loudest failure this crate can produce.
+#[cfg(test)]
+fn burn_stack_to(target: usize) -> usize {
+    // 64 KiB per frame: ~40 frames to pass 2.5 MiB, which keeps the
+    // recursion shallow enough to stay honest about what it measured.
+    let mut frame = [0u8; 64 * 1024];
+    // Touch it, so the pages are faulted in rather than merely reserved.
+    frame[0] = 1;
+    frame[frame.len() - 1] = 1;
+    std::hint::black_box(&frame);
+    let used = worker_stack::used_here(worker_stack::here()).unwrap_or(0);
+    if used >= target {
+        used
+    } else {
+        burn_stack_to(target)
+    }
+}
+
+#[test]
+fn a_work_stealing_worker_knows_where_its_stack_starts() {
+    let rt = RuntimeBuilder::new(1, "stack-probe")
+        .thread_stack_size(4 * 1024 * 1024)
+        .build();
+    let (tx, rx) = std::sync::mpsc::channel();
+    rt.get_handle().spawn(async move {
+        tx.send((worker_stack::base(), worker_stack::size())).ok();
+    });
+    let (base, size) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the worker thread runs the probe");
+    assert_ne!(base, 0, "a runtime worker has to record its stack base");
+    assert_eq!(
+        size,
+        4 * 1024 * 1024,
+        "the worker reports the stack it was configured with"
+    );
+}
+
+#[test]
+fn a_no_steal_worker_knows_where_its_stack_starts() {
+    let rt = RuntimeBuilder::new(1, "stack-probe-no-steal")
+        .work_steal(false)
+        .thread_stack_size(4 * 1024 * 1024)
+        .build();
+    let (tx, rx) = std::sync::mpsc::channel();
+    rt.get_handle().spawn(async move {
+        tx.send((worker_stack::base(), worker_stack::size())).ok();
+    });
+    let (base, size) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the worker thread runs the probe");
+    assert_ne!(base, 0, "a no-steal worker has to record its stack base");
+    assert_eq!(size, 4 * 1024 * 1024);
+    // Keep the runtime, and so its worker thread, alive for the rest of
+    // the process, the way a server's runtime lives for the life of the
+    // server. `init_pools` registers the pool in the process-global
+    // `CURRENT_HANDLE`, which is a `thread_local::ThreadLocal` keyed by
+    // a thread id the crate recycles when a thread exits. Letting this
+    // runtime's thread exit here frees an id that a later thread picks
+    // up along with the registration, and `current_handle()` then hands
+    // that thread a handle to a runtime that is already shut down.
+    std::mem::forget(rt);
+}
+
+/// The option is load-bearing, not decorative.
+///
+/// Tokio's default worker stack is 2 MiB. This asks for 4 MiB and then
+/// actually uses more than 2 MiB of it. If `thread_stack_size` were
+/// dropped on the floor the recursion would run off the end of the
+/// default stack and abort the test binary, so this cannot pass by
+/// accident.
+#[test]
+fn a_worker_gets_the_stack_it_was_configured_with() {
+    const TOKIO_DEFAULT_STACK: usize = 2 * 1024 * 1024;
+    let rt = RuntimeBuilder::new(1, "stack-burn")
+        .thread_stack_size(4 * 1024 * 1024)
+        .build();
+    let (tx, rx) = std::sync::mpsc::channel();
+    rt.get_handle().spawn(async move {
+        tx.send(burn_stack_to(TOKIO_DEFAULT_STACK + 256 * 1024))
+            .ok();
+    });
+    let used = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the worker thread survives past tokio's default stack");
+    assert!(
+        used > TOKIO_DEFAULT_STACK,
+        "the worker only reached {used} bytes, which fits tokio's default stack"
+    );
+}
+
+#[test]
+fn a_zero_stack_size_falls_back_to_the_default() {
+    let opts = RuntimeOpts {
+        thread_stack_size: Some(0),
+        ..RuntimeOpts::default()
+    };
+    assert_eq!(
+        opts.resolved_thread_stack_size(),
+        DEFAULT_THREAD_STACK_SIZE,
+        "a zero would make tokio panic on build; the default is the better answer"
+    );
+    assert_eq!(
+        RuntimeOpts::default().resolved_thread_stack_size(),
+        DEFAULT_THREAD_STACK_SIZE,
+        "unset means the default"
+    );
+}
+
+/// A thread that never joined a no-steal runtime must not inherit one.
+///
+/// `CURRENT_HANDLE` is keyed by a thread id the `thread_local` crate
+/// recycles, so the slot a no-steal worker filled outlives it and turns
+/// up under whichever later thread is given the same id. Before the
+/// owner check, `current_handle()` on that thread returned a handle to
+/// the shut-down runtime and every task spawned through it was cancelled
+/// on arrival. This drops a no-steal runtime, waits for its threads to
+/// exit so their ids are free, and then asks a series of fresh threads
+/// for a handle while a live work-stealing runtime is current.
+#[test]
+fn a_thread_that_never_joined_a_no_steal_runtime_is_not_handed_a_dead_one() {
+    let recycled = Runtime::new_no_steal(2, "recycled");
+    // Touch the handle so the pools, and the registrations, are built.
+    let _ = recycled.get_handle();
+    // Joins the worker threads, which is what frees their ids.
+    recycled.shutdown_timeout(Duration::from_secs(5));
+
+    let live = Runtime::new_steal(2, "live");
+    for attempt in 0..16 {
+        let handle = live.get_handle().clone();
+        std::thread::spawn(move || {
+            handle.block_on(async {
+                current_handle()
+                    .spawn(async { 7 })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("attempt {attempt} spawned onto a dead runtime: {e}")
+                    })
+            })
+        })
+        .join()
+        .expect("the probe thread runs to completion");
+    }
 }
