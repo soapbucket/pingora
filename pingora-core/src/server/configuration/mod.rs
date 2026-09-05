@@ -708,14 +708,12 @@ runtime_thread_stack_size: 16777216
         init_log();
         let conf = ServerConf::from_yaml("---\nversion: 1\n").unwrap();
         assert_eq!(conf.runtime_thread_stack_size, None);
-        // Against the process default rather than the crate constant.
-        // "Unset means the process default" is the actual contract, and
-        // asserting the constant would make this test depend on no other
-        // test in the binary having set the global, which is not a
-        // property a unit test should be asserting by accident.
+        // Preserve the unset option so the runtime resolves its process
+        // default. Comparing two global reads would race the offload test
+        // that changes that default; runtime tests cover the resolution.
         assert_eq!(
-            conf.runtime_opts().resolved_thread_stack_size(),
-            pingora_runtime::worker_stack::process_default_stack_size(),
+            conf.runtime_opts().thread_stack_size,
+            None,
             "a server that says nothing gets the process default stack"
         );
     }

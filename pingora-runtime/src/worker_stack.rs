@@ -247,19 +247,32 @@ mod tests {
 
     #[test]
     fn the_process_default_is_the_crate_default_until_it_is_set() {
-        assert_eq!(
-            process_default_stack_size(),
-            crate::DEFAULT_THREAD_STACK_SIZE
-        );
+        // Keep the default-value assertions with the only test that changes
+        // it, so libtest's parallel execution cannot observe a transient value.
+        let assert_default = |expected| {
+            assert_eq!(process_default_stack_size(), expected);
+            assert_eq!(
+                crate::RuntimeOpts::default().resolved_thread_stack_size(),
+                expected,
+                "unset means the process default"
+            );
+            assert_eq!(
+                crate::RuntimeOpts {
+                    thread_stack_size: Some(0),
+                    ..crate::RuntimeOpts::default()
+                }
+                .resolved_thread_stack_size(),
+                expected,
+                "zero uses the process default rather than an invalid stack size"
+            );
+        };
+        assert_default(crate::DEFAULT_THREAD_STACK_SIZE);
         set_process_default_stack_size(3 * 1024 * 1024);
-        assert_eq!(process_default_stack_size(), 3 * 1024 * 1024);
+        assert_default(3 * 1024 * 1024);
         // A zero restores the default rather than producing a thread
         // with no stack.
         set_process_default_stack_size(0);
-        assert_eq!(
-            process_default_stack_size(),
-            crate::DEFAULT_THREAD_STACK_SIZE
-        );
+        assert_default(crate::DEFAULT_THREAD_STACK_SIZE);
     }
 
     #[test]

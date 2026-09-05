@@ -703,24 +703,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_connector_bind_to() {
-        // connect to remote while bind to localhost will fail
-        let peer = BasicPeer::new("240.0.0.1:80");
+        // Keep the configured source port occupied. Ignoring bind_to would
+        // connect successfully to the destination, while honoring it must
+        // fail at bind time on every platform, without an external route.
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = BasicPeer::new(&destination.local_addr().unwrap().to_string());
         let mut conf = ConnectorOptions::new(1);
-        conf.bind_to_v4.push("127.0.0.1:0".parse().unwrap());
+        conf.bind_to_v4.push(occupied_source.local_addr().unwrap());
         let connector = TransportConnector::new(Some(conf));
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // The exact error varies by platform: Linux may return ConnectError,
-        // some systems time out (ConnectTimedout), and macOS/others may
-        // return ConnectNoRoute (ENETUNREACH) for unreachable addresses.
-        assert!(
-            error.etype() == &ConnectError
-                || error.etype() == &ConnectTimedout
-                || error.etype() == &ConnectNoRoute,
-            "unexpected error type: {:?}",
-            error.etype()
-        )
+        assert_eq!(error.etype(), &InternalError, "{error:?}");
+        assert_eq!(error.root_etype(), &BindError, "{error:?}");
     }
 
     /// Helper function for testing error handling in the `do_connect` function.

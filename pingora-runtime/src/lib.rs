@@ -1044,24 +1044,6 @@ fn a_worker_gets_the_stack_it_was_configured_with() {
     );
 }
 
-#[test]
-fn a_zero_stack_size_falls_back_to_the_default() {
-    let opts = RuntimeOpts {
-        thread_stack_size: Some(0),
-        ..RuntimeOpts::default()
-    };
-    assert_eq!(
-        opts.resolved_thread_stack_size(),
-        DEFAULT_THREAD_STACK_SIZE,
-        "a zero would make tokio panic on build; the default is the better answer"
-    );
-    assert_eq!(
-        RuntimeOpts::default().resolved_thread_stack_size(),
-        DEFAULT_THREAD_STACK_SIZE,
-        "unset means the default"
-    );
-}
-
 /// A thread that never joined a no-steal runtime must not inherit one.
 ///
 /// `CURRENT_HANDLE` is keyed by a thread id the `thread_local` crate
